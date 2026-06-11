@@ -4,6 +4,7 @@ __pycache__/
 
 # PyInstaller intermediate output
 build/
+dist/
 *.toc
 *.pkg
 *.pyz
@@ -20,4 +21,3 @@ downloads/
 idm_downloads/
 fusion_download_plan_*.txt
 fusion_idm_downloads_*.txt
-

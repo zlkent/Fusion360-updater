@@ -1,0 +1,83 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Create a GitHub Release"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      tag_name:
+        description: "Release tag, required when publish_release is true. Example: v0.1.0"
+        required: false
+        type: string
+      release_notes:
+        description: "Release changelog, required when publish_release is true"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Syntax check
+        run: python -m py_compile fusion360_updater_gui.py
+
+      - name: Build executable
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fusion360Updater
+          path: dist/Fusion360Updater.exe
+          if-no-files-found: error
+
+      - name: Validate release inputs
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true' }}
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAG_NAME)) {
+            throw "tag_name is required when publish_release is true."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_NOTES)) {
+            throw "release_notes is required when publish_release is true."
+          }
+
+      - name: Create GitHub release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ inputs.tag_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          Set-Content -Path release-notes.md -Value $env:RELEASE_NOTES -Encoding UTF8
+          gh release create $env:TAG_NAME dist/Fusion360Updater.exe --title $env:TAG_NAME --notes-file release-notes.md
