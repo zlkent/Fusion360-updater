@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# PyInstaller intermediate output
+build/
+*.toc
+*.pkg
+*.pyz
+
+# Local runtime state
+fusion360_updater_config.json
+dist/fusion360_updater_config.json
+*.log
+*.out
+*.err
+
+# Local downloads and generated plans
+downloads/
+idm_downloads/
+fusion_download_plan_*.txt
+fusion_idm_downloads_*.txt
+
