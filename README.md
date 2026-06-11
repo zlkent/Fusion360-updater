@@ -68,7 +68,22 @@ dist\Fusion360Updater.exe
 
 `.github/workflows/build.yml` 会在 push、pull request 和手动触发时自动编译并上传 `Fusion360Updater.exe` artifact。
 
-发布正式版本时：
+推荐发布方式是推送版本 tag。发布前必须在 `CHANGELOG.md` 写好对应版本段落，例如：
+
+```markdown
+## v0.1.0
+```
+
+然后推送 tag：
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+workflow 会重新编译，并用 `CHANGELOG.md` 中对应 tag 的段落创建 GitHub Release。如果找不到对应更新日志，发布会失败。
+
+也可以手动发布：
 
 1. 打开 GitHub Actions 的 `Build` workflow。
 2. 选择 `Run workflow`。
@@ -182,7 +197,22 @@ dist\Fusion360Updater.exe
 
 `.github/workflows/build.yml` builds and uploads the `Fusion360Updater.exe` artifact on push, pull request, and manual workflow runs.
 
-To publish a release:
+The recommended release path is to push a version tag. Before publishing, add a matching section to `CHANGELOG.md`, for example:
+
+```markdown
+## v0.1.0
+```
+
+Then push the tag:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow rebuilds the executable and creates a GitHub Release from the matching `CHANGELOG.md` section. If the changelog section is missing, the release fails.
+
+Manual releases are also supported:
 
 1. Open the `Build` workflow in GitHub Actions.
 2. Select `Run workflow`.

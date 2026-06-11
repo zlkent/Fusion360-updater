@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
     inputs:
@@ -57,7 +59,7 @@ jobs:
           path: dist/Fusion360Updater.exe
           if-no-files-found: error
 
-      - name: Validate release inputs
+      - name: Prepare manual release notes
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true' }}
         shell: pwsh
         env:
@@ -70,14 +72,51 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:RELEASE_NOTES)) {
             throw "release_notes is required when publish_release is true."
           }
+          Set-Content -Path release-tag.txt -Value $env:TAG_NAME -Encoding UTF8
+          Set-Content -Path release-notes.md -Value $env:RELEASE_NOTES -Encoding UTF8
+
+      - name: Prepare tag release notes
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if (!(Test-Path CHANGELOG.md)) {
+            throw "CHANGELOG.md is required for tag releases."
+          }
+
+          $lines = Get-Content CHANGELOG.md
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^\s*##\s+\[?$([regex]::Escape($env:TAG_NAME))\]?\s*$") {
+              $start = $i
+              break
+            }
+          }
+          if ($start -lt 0) {
+            throw "CHANGELOG.md must contain a '## $env:TAG_NAME' section for tag releases."
+          }
+
+          $end = $lines.Count
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^\s*##\s+") {
+              $end = $i
+              break
+            }
+          }
+
+          $notes = $lines[($start + 1)..($end - 1)] -join "`n"
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            throw "CHANGELOG.md section for $env:TAG_NAME is empty."
+          }
+          Set-Content -Path release-tag.txt -Value $env:TAG_NAME -Encoding UTF8
+          Set-Content -Path release-notes.md -Value $notes -Encoding UTF8
 
       - name: Create GitHub release
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true' }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_release == 'true') || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ inputs.tag_name }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
-          Set-Content -Path release-notes.md -Value $env:RELEASE_NOTES -Encoding UTF8
-          gh release create $env:TAG_NAME dist/Fusion360Updater.exe --title $env:TAG_NAME --notes-file release-notes.md
+          $tag = (Get-Content release-tag.txt -Raw).Trim()
+          gh release create $tag dist/Fusion360Updater.exe --title $tag --notes-file release-notes.md
