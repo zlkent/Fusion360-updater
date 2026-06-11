@@ -8,7 +8,9 @@ import sys
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +34,7 @@ IDM_PATHS = (
     Path(r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe"),
     Path(r"C:\Program Files\Internet Download Manager\IDMan.exe"),
 )
+XZ_MAGIC = b"\xfd7zXZ\x00"
 
 
 def runtime_dir() -> Path:
@@ -66,6 +69,12 @@ def default_log_dir() -> Path:
     return path
 
 
+def default_package_cache_dir() -> Path:
+    path = user_state_dir() / "package_cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -77,6 +86,36 @@ class CheckResult:
     version: str = ""
     launch_exe: str = ""
     log_path: str = ""
+
+
+@dataclass
+class CacheFileState:
+    url: str
+    filename: str
+    expected_size: int
+    path: str
+    present: bool
+    valid: bool
+    actual_size: int
+    reason: str = ""
+
+
+@dataclass
+class PackageCacheStatus:
+    version: str
+    release: str
+    cache_dir: str
+    total: int
+    cached: int
+    missing: int
+    invalid: int
+    expected_bytes: int
+    cached_bytes: int
+    items: list[CacheFileState]
+
+    @property
+    def complete(self) -> bool:
+        return self.total > 0 and self.cached == self.total and self.invalid == 0 and self.missing == 0
 
 
 class FusionUpdaterCore:
@@ -562,6 +601,102 @@ class FusionUpdaterCore:
                 downloads.append((url, filename, content_size if len(archive_ids) == 1 else 0))
         return version, release, downloads
 
+    def validate_cache_file(self, url: str, filename: str, expected_size: int, cache_dir: Path) -> CacheFileState:
+        target = cache_dir / filename
+        if not target.exists():
+            return CacheFileState(url, filename, expected_size, str(target), False, False, 0, "missing")
+        try:
+            actual_size = target.stat().st_size
+            if expected_size > 0 and actual_size != expected_size:
+                return CacheFileState(
+                    url,
+                    filename,
+                    expected_size,
+                    str(target),
+                    True,
+                    False,
+                    actual_size,
+                    f"size mismatch: expected {expected_size}, got {actual_size}",
+                )
+            with target.open("rb") as fh:
+                header = fh.read(len(XZ_MAGIC))
+            if header != XZ_MAGIC:
+                return CacheFileState(
+                    url,
+                    filename,
+                    expected_size,
+                    str(target),
+                    True,
+                    False,
+                    actual_size,
+                    "not an xz archive",
+                )
+            return CacheFileState(url, filename, expected_size, str(target), True, True, actual_size)
+        except OSError as exc:
+            return CacheFileState(url, filename, expected_size, str(target), True, False, 0, str(exc))
+
+    def inspect_package_cache(self, mode: str, proxy_url: str, cache_dir: Path) -> PackageCacheStatus:
+        version, release, downloads = self.build_package_downloads(mode, proxy_url)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        items = [
+            self.validate_cache_file(url, filename, size, cache_dir)
+            for url, filename, size in downloads
+        ]
+        cached = sum(1 for item in items if item.valid)
+        missing = sum(1 for item in items if not item.present)
+        invalid = sum(1 for item in items if item.present and not item.valid)
+        expected_bytes = sum(item.expected_size for item in items if item.expected_size > 0)
+        cached_bytes = sum(item.actual_size for item in items if item.valid)
+        return PackageCacheStatus(
+            version=version,
+            release=release,
+            cache_dir=str(cache_dir),
+            total=len(items),
+            cached=cached,
+            missing=missing,
+            invalid=invalid,
+            expected_bytes=expected_bytes,
+            cached_bytes=cached_bytes,
+            items=items,
+        )
+
+    def write_cache_manifest(self, status: PackageCacheStatus, destination: Path) -> Path:
+        destination.mkdir(parents=True, exist_ok=True)
+        out = destination / f"fusion_package_cache_{status.version or 'unknown'}_{now_stamp()}.json"
+        payload = {
+            "manifest": MANIFEST_URL,
+            "build_version": status.version,
+            "release_version": status.release,
+            "cache_dir": status.cache_dir,
+            "total": status.total,
+            "cached": status.cached,
+            "missing": status.missing,
+            "invalid": status.invalid,
+            "complete": status.complete,
+            "expected_bytes": status.expected_bytes,
+            "cached_bytes": status.cached_bytes,
+            "items": [item.__dict__ for item in status.items],
+        }
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out
+
+    def fill_package_cache(self, mode: str, proxy_url: str, cache_dir: Path) -> PackageCacheStatus:
+        status = self.inspect_package_cache(mode, proxy_url, cache_dir)
+        pending = [item for item in status.items if not item.valid]
+        if not pending:
+            self.log("本地包缓存已完整，无需补齐。")
+            return status
+        for index, item in enumerate(pending, start=1):
+            if self.stop_event.is_set():
+                self.log("已停止补齐缓存。")
+                break
+            self.log(f"补齐缓存 {index}/{len(pending)}: {item.filename}")
+            self.download_url_to_file(item.url, mode, proxy_url, Path(item.path))
+            checked = self.validate_cache_file(item.url, item.filename, item.expected_size, cache_dir)
+            if not checked.valid:
+                raise RuntimeError(f"缓存文件校验失败: {item.filename}, {checked.reason}")
+        return self.inspect_package_cache(mode, proxy_url, cache_dir)
+
     def export_download_plan(self, mode: str, proxy_url: str, destination: Path) -> Path:
         version, release, downloads = self.build_package_downloads(mode, proxy_url)
         destination.mkdir(parents=True, exist_ok=True)
@@ -622,19 +757,19 @@ class FusionUpdaterCore:
             )
         return list_path, len(downloads)
 
-    def download_url(self, url: str, mode: str, proxy_url: str, destination: Path) -> Path:
-        destination.mkdir(parents=True, exist_ok=True)
-        name = url.rstrip("/").split("/")[-1] or f"download-{now_stamp()}"
-        target = destination / name
+    def download_url_to_file(self, url: str, mode: str, proxy_url: str, target: Path) -> Path:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f"{target.name}.part")
+        tmp.unlink(missing_ok=True)
         opener = self.urllib_opener(mode, proxy_url)
         req = urllib.request.Request(url, headers={"User-Agent": "Fusion360Updater/1.0"})
         try:
-            with opener.open(req, timeout=120) as resp, target.open("wb") as fh:
+            with opener.open(req, timeout=120) as resp, tmp.open("wb") as fh:
                 shutil.copyfileobj(resp, fh)
         except Exception as exc:
             self.log(f"urllib 下载失败，切换 curl.exe: {exc}")
             args = self.curl_args(url, mode, proxy_url, head=False, timeout=300)
-            args = args[:-1] + ["-o", str(target), url]
+            args = args[:-1] + ["-o", str(tmp), url]
             completed = subprocess.run(
                 args,
                 stdout=subprocess.PIPE,
@@ -645,18 +780,161 @@ class FusionUpdaterCore:
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             if completed.returncode != 0:
+                tmp.unlink(missing_ok=True)
                 raise urllib.error.URLError((completed.stdout + completed.stderr).strip())
+        tmp.replace(target)
         return target
+
+    def download_url(self, url: str, mode: str, proxy_url: str, destination: Path) -> Path:
+        destination.mkdir(parents=True, exist_ok=True)
+        name = url.rstrip("/").split("/")[-1] or f"download-{now_stamp()}"
+        return self.download_url_to_file(url, mode, proxy_url, destination / name)
+
+    def create_cache_server(self, cache_dir: Path, mode: str, proxy_url: str, host: str = "127.0.0.1", port: int = 0):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        core = self
+
+        class CacheHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                core.log("缓存端点: " + (fmt % args))
+
+            def send_text(self, code: int, text: str, content_type: str = "text/plain; charset=utf-8"):
+                body = text.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def do_CONNECT(self):
+                self.send_text(
+                    501,
+                    "HTTPS CONNECT cannot be served from cache without TLS interception. "
+                    "Use the cache endpoint URL for direct package downloads.",
+                )
+
+            def do_HEAD(self):
+                self.handle_request(head_only=True)
+
+            def do_GET(self):
+                self.handle_request(head_only=False)
+
+            def normalized_path(self) -> str:
+                parsed = urllib.parse.urlsplit(self.path)
+                if parsed.scheme in ("http", "https"):
+                    return urllib.parse.unquote(parsed.path)
+                return urllib.parse.unquote(urllib.parse.urlsplit("http://cache.local" + self.path).path)
+
+            def handle_request(self, head_only: bool):
+                request_path = self.normalized_path()
+                if request_path == "/health":
+                    payload = {
+                        "ok": True,
+                        "service": SERVICE,
+                        "cache_dir": str(cache_dir),
+                        "note": "direct local cache endpoint, not HTTPS MITM",
+                    }
+                    return self.send_text(200, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
+
+                package_prefix = f"/{SERVICE}/packages/"
+                if request_path.startswith(package_prefix) and request_path.endswith(".tar.xz"):
+                    filename = Path(request_path.rsplit("/", 1)[-1]).name
+                    archive_id = filename[:-7]
+                    if not PACKAGE_ID_RE.fullmatch(archive_id):
+                        return self.send_text(400, "invalid package archive name")
+                    url = f"https://dl.appstreaming.autodesk.com/{SERVICE}/packages/{filename}"
+                    target = cache_dir / filename
+                    state = core.validate_cache_file(url, filename, 0, cache_dir)
+                    if not state.valid:
+                        core.log(f"缓存端点缺失，转取 Autodesk: {filename}")
+                        try:
+                            core.download_url_to_file(url, mode, proxy_url, target)
+                        except Exception as exc:
+                            return self.send_text(502, f"cache fill failed: {exc}")
+                        state = core.validate_cache_file(url, filename, 0, cache_dir)
+                    if not state.valid:
+                        return self.send_text(502, f"cached file is invalid: {state.reason}")
+                    return self.serve_file(target, head_only)
+
+                if request_path.startswith(f"/{SERVICE}/"):
+                    url = f"https://dl.appstreaming.autodesk.com{request_path}"
+                    try:
+                        opener = core.urllib_opener(mode, proxy_url)
+                        req = urllib.request.Request(url, headers={"User-Agent": "Fusion360Updater/1.0"})
+                        with opener.open(req, timeout=60) as resp:
+                            body = resp.read()
+                            content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                    except Exception as exc:
+                        return self.send_text(502, f"upstream fetch failed: {exc}")
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    if not head_only:
+                        self.wfile.write(body)
+                    return
+
+                return self.send_text(404, "unsupported cache path")
+
+            def serve_file(self, target: Path, head_only: bool):
+                size = target.stat().st_size
+                start, end = 0, size - 1
+                range_header = self.headers.get("Range", "")
+                status = 200
+                if range_header.startswith("bytes="):
+                    match = re.match(r"bytes=(\d*)-(\d*)", range_header)
+                    if match:
+                        if match.group(1):
+                            start = int(match.group(1))
+                        if match.group(2):
+                            end = int(match.group(2))
+                        end = min(end, size - 1)
+                        if start > end or start >= size:
+                            self.send_response(416)
+                            self.send_header("Content-Range", f"bytes */{size}")
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
+                        status = 206
+                length = end - start + 1
+                self.send_response(status)
+                self.send_header("Content-Type", "application/x-xz")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                if head_only:
+                    return
+                with target.open("rb") as fh:
+                    fh.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = fh.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        try:
+                            self.wfile.write(chunk)
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+                        remaining -= len(chunk)
+
+        return ThreadingHTTPServer((host, port), CacheHandler)
 
 
 class FusionUpdaterApp:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("Fusion 360 更新器")
-        self.root.geometry("980x720")
+        self.root.geometry("1040x820")
         self.stop_event = threading.Event()
         self.messages = queue.Queue()
         self.worker = None
+        self.cache_server = None
+        self.cache_server_thread = None
         self.config_path = writable_config_path()
         self.config = self.load_config()
         self.core = FusionUpdaterCore(self.enqueue_log, self.stop_event)
@@ -673,12 +951,16 @@ class FusionUpdaterApp:
         self.full_deploy_var = BooleanVar(value=bool(self.config.get("full_deploy", True)))
         self.no_cleanup_var = BooleanVar(value=bool(self.config.get("no_cleanup", True)))
         self.log_dir_var = StringVar(value=self.config.get("log_dir") or str(default_log_dir()))
+        self.cache_dir_var = StringVar(value=self.config.get("cache_dir") or str(default_package_cache_dir()))
+        self.cache_status_var = StringVar(value="未检查")
+        self.cache_proxy_var = StringVar(value="未启动")
         self.download_url_var = StringVar(value=MANIFEST_URL)
         self.idm_path_var = StringVar(value=self.config.get("idm_path") or self.core.find_idm())
 
         self.build_ui()
         self.poll_messages()
         self.save_config()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_config(self) -> dict:
         defaults = {
@@ -690,6 +972,7 @@ class FusionUpdaterApp:
             "full_deploy": True,
             "no_cleanup": True,
             "log_dir": str(default_log_dir()),
+            "cache_dir": str(default_package_cache_dir()),
             "idm_path": "",
         }
         if self.config_path.exists():
@@ -709,6 +992,7 @@ class FusionUpdaterApp:
             "full_deploy": self.full_deploy_var.get(),
             "no_cleanup": self.no_cleanup_var.get(),
             "log_dir": self.log_dir_var.get().strip(),
+            "cache_dir": self.cache_dir_var.get().strip(),
             "idm_path": self.idm_path_var.get().strip(),
         }
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -782,6 +1066,23 @@ class FusionUpdaterApp:
         ttk.Button(manual, text="探测 IDM", command=self.detect_idm).grid(row=1, column=2, padx=8, pady=8)
         manual.columnconfigure(1, weight=1)
 
+        cache = ttk.LabelFrame(root, text="本地包缓存")
+        cache.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(cache, text="缓存目录").grid(row=0, column=0, padx=8, pady=8, sticky=tk.W)
+        ttk.Entry(cache, textvariable=self.cache_dir_var).grid(row=0, column=1, sticky=tk.EW, padx=8, pady=8)
+        ttk.Button(cache, text="选择", command=self.pick_cache_dir).grid(row=0, column=2, padx=8, pady=8)
+        ttk.Button(cache, text="打开", command=self.open_cache_dir).grid(row=0, column=3, padx=8, pady=8)
+        ttk.Label(cache, text="缓存状态").grid(row=1, column=0, padx=8, pady=8, sticky=tk.W)
+        ttk.Label(cache, textvariable=self.cache_status_var).grid(row=1, column=1, sticky=tk.W, padx=8, pady=8)
+        ttk.Button(cache, text="检查缓存", command=self.check_cache).grid(row=1, column=2, padx=8, pady=8)
+        ttk.Button(cache, text="补齐缓存", command=self.fill_cache).grid(row=1, column=3, padx=8, pady=8)
+        ttk.Button(cache, text="导出清单", command=self.export_cache_manifest).grid(row=1, column=4, padx=8, pady=8)
+        ttk.Label(cache, text="缓存端点").grid(row=2, column=0, padx=8, pady=8, sticky=tk.W)
+        ttk.Label(cache, textvariable=self.cache_proxy_var).grid(row=2, column=1, sticky=tk.W, padx=8, pady=8)
+        ttk.Button(cache, text="启动端点", command=self.start_cache_proxy).grid(row=2, column=2, padx=8, pady=8)
+        ttk.Button(cache, text="停止端点", command=self.stop_cache_proxy).grid(row=2, column=3, padx=8, pady=8)
+        cache.columnconfigure(1, weight=1)
+
         log_frame = ttk.LabelFrame(root, text="日志")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=18)
@@ -813,6 +1114,10 @@ class FusionUpdaterApp:
                     self.installed_var.set(value)
                 elif kind == "official":
                     self.official_var.set(value)
+                elif kind == "cache_status":
+                    self.cache_status_var.set(value)
+                elif kind == "cache_proxy":
+                    self.cache_proxy_var.set(value)
         except queue.Empty:
             pass
         self.root.after(150, self.poll_messages)
@@ -862,6 +1167,39 @@ class FusionUpdaterApp:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def pick_cache_dir(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.cache_dir_var.set(path)
+            self.save_config()
+
+    def open_cache_dir(self):
+        path = self.cache_dir()
+        os.startfile(str(path))
+
+    def cache_dir(self) -> Path:
+        path = Path(self.cache_dir_var.get().strip() or str(default_package_cache_dir()))
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def format_bytes(self, value: int) -> str:
+        if value <= 0:
+            return "unknown"
+        units = ["B", "KB", "MB", "GB"]
+        number = float(value)
+        for unit in units:
+            if number < 1024 or unit == units[-1]:
+                return f"{number:.1f} {unit}" if unit != "B" else f"{int(number)} B"
+            number /= 1024
+
+    def format_cache_status(self, status: PackageCacheStatus) -> str:
+        state = "完整" if status.complete else "未完整"
+        return (
+            f"{state}: {status.cached}/{status.total} 个包, "
+            f"缺失 {status.missing}, 异常 {status.invalid}, "
+            f"已缓存 {self.format_bytes(status.cached_bytes)}"
+        )
+
     def streamer_path(self) -> str:
         path = self.streamer_var.get().strip() or self.core.find_streamer()
         if path:
@@ -870,6 +1208,95 @@ class FusionUpdaterApp:
 
     def proxy_settings(self) -> tuple[str, str]:
         return self.proxy_mode_var.get(), self.proxy_url_var.get().strip()
+
+    def check_cache(self):
+        def work():
+            mode, proxy = self.proxy_settings()
+            try:
+                status = self.core.inspect_package_cache(mode, proxy, self.cache_dir())
+                label = self.format_cache_status(status)
+                self.messages.put(("cache_status", label))
+                self.enqueue_log(f"缓存检查: {label}")
+                if status.invalid:
+                    bad = [item for item in status.items if item.present and not item.valid][:5]
+                    for item in bad:
+                        self.enqueue_log(f"异常缓存: {item.filename} - {item.reason}")
+                self.enqueue_log(
+                    "说明: 普通 HTTP 缓存端点不能透明接管 streamer.exe 的 HTTPS CONNECT 更新流量。"
+                )
+            except Exception as exc:
+                self.enqueue_log(f"缓存检查失败: {exc}")
+            self.set_status("就绪")
+        self.run_worker("检查缓存", work)
+
+    def fill_cache(self):
+        if not messagebox.askyesno(
+            "补齐缓存",
+            "补齐缓存会下载当前 Fusion 360 manifest 缺失或异常的 .tar.xz 包，可能占用数 GB 空间。继续？",
+        ):
+            return
+
+        def work():
+            mode, proxy = self.proxy_settings()
+            try:
+                status = self.core.fill_package_cache(mode, proxy, self.cache_dir())
+                label = self.format_cache_status(status)
+                self.messages.put(("cache_status", label))
+                out = self.core.write_cache_manifest(status, self.cache_dir())
+                self.enqueue_log(f"缓存补齐完成: {label}")
+                self.enqueue_log(f"缓存清单: {out}")
+            except Exception as exc:
+                self.enqueue_log(f"补齐缓存失败: {exc}")
+            self.set_status("就绪")
+        self.run_worker("补齐缓存", work)
+
+    def export_cache_manifest(self):
+        def work():
+            mode, proxy = self.proxy_settings()
+            try:
+                status = self.core.inspect_package_cache(mode, proxy, self.cache_dir())
+                out = self.core.write_cache_manifest(status, self.cache_dir())
+                label = self.format_cache_status(status)
+                self.messages.put(("cache_status", label))
+                self.enqueue_log(f"已导出缓存清单: {out}")
+            except Exception as exc:
+                self.enqueue_log(f"导出缓存清单失败: {exc}")
+            self.set_status("就绪")
+        self.run_worker("导出缓存清单", work)
+
+    def start_cache_proxy(self):
+        if self.cache_server:
+            self.append_log("缓存端点已在运行。")
+            return
+        try:
+            mode, proxy = self.proxy_settings()
+            server = self.core.create_cache_server(self.cache_dir(), mode, proxy)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.cache_server = server
+            self.cache_server_thread = thread
+            url = f"http://127.0.0.1:{server.server_port}"
+            self.cache_proxy_var.set(f"运行中: {url}")
+            self.append_log(f"本地缓存端点: {url}")
+            self.append_log(f"包路径示例: {url}/{SERVICE}/packages/<archive-id>.tar.xz")
+            self.append_log("该端点可服务直接 HTTP 包请求；不会对 streamer.exe 做 HTTPS MITM。")
+            self.save_config()
+        except Exception as exc:
+            messagebox.showerror("启动失败", str(exc))
+
+    def stop_cache_proxy(self, silent: bool = False):
+        if not self.cache_server:
+            if not silent:
+                self.append_log("缓存端点未运行。")
+            return
+        server = self.cache_server
+        self.cache_server = None
+        self.cache_server_thread = None
+        server.shutdown()
+        server.server_close()
+        self.cache_proxy_var.set("未启动")
+        if not silent:
+            self.append_log("缓存端点已停止。")
 
     def test_manifest(self):
         def work():
@@ -932,6 +1359,21 @@ class FusionUpdaterApp:
                 self.enqueue_log(f"目标版本: {version} ({release})")
             except Exception as exc:
                 self.enqueue_log(f"读取最新 manifest 失败，仍可尝试 updater 自行处理: {exc}")
+            try:
+                cache_dir = self.cache_dir()
+                if any(cache_dir.glob("*.tar.xz")):
+                    cache_status = self.core.inspect_package_cache(mode, proxy, cache_dir)
+                    label = self.format_cache_status(cache_status)
+                    self.messages.put(("cache_status", label))
+                    self.enqueue_log(f"更新前缓存状态: {label}")
+                    if cache_status.complete:
+                        self.enqueue_log(
+                            "本地包缓存完整；streamer.exe 更新仍按 Autodesk 官方 HTTPS 流程执行。"
+                        )
+                    else:
+                        self.enqueue_log("缓存未完整，可先使用“补齐缓存”或“用 IDM 下载清单”补齐。")
+            except Exception as exc:
+                self.enqueue_log(f"更新前缓存检查跳过: {exc}")
             result = self.core.run_update_with_retries(
                 streamer=streamer,
                 mode=mode,
@@ -1018,16 +1460,22 @@ class FusionUpdaterApp:
                 out, count = self.core.send_manifest_packages_to_idm(
                     mode,
                     proxy,
-                    self.log_dir() / "idm_downloads",
+                    self.cache_dir(),
                     self.idm_path_var.get(),
                     start_queue=True,
                 )
                 self.enqueue_log(f"已加入 IDM 队列: {count} 个包")
+                self.enqueue_log(f"下载目录: {self.cache_dir()}")
                 self.enqueue_log(f"URL 清单: {out}")
             except Exception as exc:
                 self.enqueue_log(f"IDM 下载清单失败: {exc}")
             self.set_status("就绪")
         self.run_worker("IDM 下载清单", work)
+
+    def on_close(self):
+        self.stop_event.set()
+        self.stop_cache_proxy(silent=True)
+        self.root.destroy()
 
 
 def main():

@@ -27,6 +27,12 @@ Fusion 360 Updater 是一个 Windows 桌面工具，用来绕过 Autodesk Fusion
   - 逐个解析 `packages/<package-id>.json`
   - 提取真实 `packages/<archive-id>.tar.xz`
   - 批量加入 IDM 队列
+- 支持本地包缓存辅助：
+  - IDM 下载目录默认指向本地缓存目录
+  - 检查 `.tar.xz` 包是否缺失、大小异常或不是 XZ 文件
+  - 补齐缺失/异常缓存包
+  - 导出缓存状态 JSON
+  - 启动本地 HTTP 缓存端点，直接请求包 URL 时优先返回本地缓存
 
 ### 运行
 
@@ -79,6 +85,7 @@ dist\Fusion360Updater.exe
 - 默认代理: `http://127.0.0.1:8001`
 - 默认更新参数: `--full-deploy --no_cleanup --threadscount 1`
 - 默认日志目录: `%LOCALAPPDATA%\Fusion360Updater\logs`
+- 默认包缓存目录: `%LOCALAPPDATA%\Fusion360Updater\package_cache`
 
 配置文件会优先写入程序同目录的 `fusion360_updater_config.json`。如果程序目录不可写，会写入：
 
@@ -95,18 +102,19 @@ dist\Fusion360Updater.exe
 - query 找到的 `Fusion360.exe` 存在。
 - `Fusion360.exe` 文件版本与 query 版本一致。
 
-### 关于离线包和 IDM
+### 本地包缓存和 IDM
 
-IDM 下载的 `.tar.xz` 文件目前是下载辅助和排查工具，不是 Autodesk 官方离线安装源。Autodesk `streamer.exe` 没有稳定公开的参数可以指定从本地目录读取这些包。
+IDM 下载的 `.tar.xz` 文件会落到本地包缓存目录。缓存功能可以：
 
-如果未来需要“先由 IDM 下载，再由 updater 从本地包更新”，需要新增本地缓存代理：
+- 解析当前 live manifest 需要的真实包文件。
+- 检查缓存完整度，并识别 HTML 错误页、缺失包和大小异常。
+- 补齐缺失或异常包。
+- 导出缓存状态 JSON。
+- 启动本地 HTTP 缓存端点，例如 `http://127.0.0.1:<port>/production/packages/<archive-id>.tar.xz`。
 
-1. IDM 把 `.tar.xz` 下载到固定目录。
-2. 更新器启动本地 HTTP 代理。
-3. `streamer.exe` 请求 Autodesk package URL 时，代理优先返回本地缓存。
-4. 缓存缺失时再转发到 Autodesk。
+本地 HTTP 缓存端点只服务直接访问该端点的包请求。Autodesk `streamer.exe` 的更新流量使用 HTTPS `CONNECT` 访问 `dl.appstreaming.autodesk.com:443`，普通 HTTP 端点不能透明读取其中的 package 路径。项目没有实现 TLS MITM、根证书注入或 hosts 劫持，因此不会把缓存端点伪装成 Autodesk 官方 HTTPS 服务。
 
-当前版本仍以 Autodesk `streamer.exe` 的 official query 结果为最终真值。
+所以当前版本支持“本地缓存校验/补齐/直接包服务”，但 official 更新完成仍以 Autodesk `streamer.exe` 的 query 结果为最终真值。
 
 ## English
 
@@ -133,6 +141,12 @@ Fusion 360 Updater is a Windows desktop utility for repairing and running Autode
   - parse each `packages/<package-id>.json`
   - extract real `packages/<archive-id>.tar.xz` URLs
   - add them to the IDM queue
+- Local package cache assistance:
+  - use the local cache directory as the default IDM destination
+  - detect missing `.tar.xz` files, size mismatches, and non-XZ error pages
+  - fill missing or invalid cached packages
+  - export a cache status JSON file
+  - start a local HTTP cache endpoint that serves direct package requests from cache first
 
 ### Run
 
@@ -185,6 +199,7 @@ If release notes are missing, the workflow fails and no GitHub Release is create
 - Default proxy: `http://127.0.0.1:8001`
 - Default update flags: `--full-deploy --no_cleanup --threadscount 1`
 - Default log directory: `%LOCALAPPDATA%\Fusion360Updater\logs`
+- Default package cache directory: `%LOCALAPPDATA%\Fusion360Updater\package_cache`
 
 The config file is written next to the executable when possible:
 
@@ -207,15 +222,16 @@ The app does not treat a downloaded file or a candidate directory as official co
 - the queried `Fusion360.exe` exists.
 - the `Fusion360.exe` file version matches the queried version.
 
-### Offline Packages and IDM
+### Local Package Cache and IDM
 
-The `.tar.xz` files downloaded by IDM are currently diagnostic/download-assist artifacts. They are not used as an Autodesk-supported offline install source. Autodesk `streamer.exe` does not expose a stable public option for installing directly from a local package directory.
+IDM downloads `.tar.xz` files into the local package cache directory. The cache tools can:
 
-To support true “download with IDM first, then update from local packages”, a local cache proxy would be needed:
+- parse the current live manifest and discover the real package archive files.
+- check cache completeness and detect HTML error pages, missing packages, and size mismatches.
+- fill missing or invalid cached packages.
+- export a cache status JSON file.
+- start a local HTTP cache endpoint, for example `http://127.0.0.1:<port>/production/packages/<archive-id>.tar.xz`.
 
-1. IDM downloads `.tar.xz` files to a fixed cache directory.
-2. The updater starts a local HTTP proxy.
-3. When `streamer.exe` requests Autodesk package URLs, the proxy serves local cached files first.
-4. Missing files are forwarded to Autodesk.
+The local HTTP cache endpoint only serves package requests that directly target that endpoint. Autodesk `streamer.exe` uses HTTPS `CONNECT` to reach `dl.appstreaming.autodesk.com:443`, so a normal HTTP endpoint cannot transparently see the encrypted package path. This project does not implement TLS MITM, root certificate injection, or hosts-file hijacking, and it does not pretend to be Autodesk's HTTPS service.
 
-For now, Autodesk `streamer.exe` query output remains the official source of truth.
+The current version therefore supports local cache verification, filling, and direct package serving. Official update completion still depends on Autodesk `streamer.exe` query output.
